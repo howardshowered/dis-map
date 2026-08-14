@@ -22,7 +22,9 @@ each entity on a world map in realtime.
 - Built-in **schematic coastline** reference layer, plus a labelled graticule
   and a live **cursor lat/lon readout**.
 - **In-app connection settings** (`S`): change the multicast group and port at
-  runtime and rejoin live, without restarting the app.
+  runtime and rejoin live, without restarting the app. The last-used group/port
+  are **persisted** to `%APPDATA%\dis-map\config.ini` and restored on next launch
+  (command-line `--group` / `--port` still override the saved values).
 - Stale tracks (no update for 30 s) are dropped automatically.
 - Optional `world.png` background (equirectangular, full -180..180 / -90..90);
   when present it replaces the built-in coastline.

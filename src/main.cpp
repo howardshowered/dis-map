@@ -23,6 +23,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <mutex>
 #include <cstdint>
 #include <cwchar>
+#include <fstream>
 
 #include "entity_store.h"
 #include "receiver.h"
@@ -62,6 +63,8 @@ static HWND                   g_hEditAddr = nullptr;
 static HWND                   g_hEditPort = nullptr;
 constexpr int                 kIdEditAddr = 101;
 constexpr int                 kIdEditPort = 102;
+
+static void saveConfig();   // persists g_group / g_port (defined below)
 
 // View transform: equirectangular normalized [0,1] * scale + offset.
 struct View {
@@ -361,6 +364,7 @@ static void applySettings(HWND hwnd) {
     g_group = addr;
     g_port  = (uint16_t)portNum;
     if (g_receiver) g_receiver->restart(g_group, g_port);
+    saveConfig();                 // remember the last-used connection
     g_selectedKey = 0;
     DestroyWindow(hwnd);
 }
@@ -550,6 +554,44 @@ static void loadWorldImage() {
     else delete i;
 }
 
+// Config file lives in %APPDATA%\dis-map\config.ini (always user-writable).
+static std::wstring configPath() {
+    wchar_t appdata[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(appdata) : L".";
+    dir += L"\\dis-map";
+    CreateDirectoryW(dir.c_str(), nullptr);   // no-op if it already exists
+    return dir + L"\\config.ini";
+}
+
+// Load persisted connection into the globals (overrides built-in defaults).
+static void loadConfig() {
+    std::ifstream f(configPath());
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        if (key == "group" && !val.empty()) {
+            g_group = val;
+        } else if (key == "port") {
+            const int p = std::atoi(val.c_str());
+            if (p >= 1 && p <= 65535) g_port = (uint16_t)p;
+        }
+    }
+}
+
+// Persist the current connection so it is restored on next launch.
+static void saveConfig() {
+    std::ofstream f(configPath(), std::ios::trunc);
+    if (!f) return;
+    f << "group=" << g_group << "\n";
+    f << "port="  << g_port  << "\n";
+}
+
 // Parse "group:port" style args; defaults match the test sender.
 static void parseArgs(std::string& group, uint16_t& port) {
     int argc = 0;
@@ -571,7 +613,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     loadWorldImage();
     g_hInst = hInst;
 
-    parseArgs(g_group, g_port);
+    loadConfig();                  // persisted last-used connection (if any)
+    parseArgs(g_group, g_port);    // command-line still overrides the config
 
     net::MulticastReceiver receiver(g_store, g_group, g_port);
     receiver.onStatus = [](const std::string& s) {
@@ -581,6 +624,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     g_receiver = &receiver;
     if (!receiver.start())
         setStatus(L"Receiver failed to start (see console).");
+    saveConfig();                  // record the connection we started with
 
     WNDCLASSW wc{};
     wc.lpfnWndProc   = WndProc;
