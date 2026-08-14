@@ -71,7 +71,9 @@ public:
                    reinterpret_cast<char*>(&tv), sizeof(tv));
 
         running_ = true;
-        status("Listening on " + group_ + ":" + std::to_string(port_));
+        std::string on = "Listening on " + group_ + ":" + std::to_string(port_);
+        if (iface_ != "0.0.0.0") on += " via " + iface_;
+        status(on);
         thread_ = std::thread([this] { runLoop(); });
         return true;
     }
@@ -84,17 +86,19 @@ public:
         WSACleanup();
     }
 
-    // Rejoin on a new group/port (stops the current listener first).
-    bool restart(std::string group, uint16_t port) {
+    // Rejoin on a new group/port/interface (stops the current listener first).
+    bool restart(std::string group, uint16_t port, std::string iface) {
         stop();
         group_ = std::move(group);
         port_  = port;
+        iface_ = std::move(iface);
         packets_ = 0;
         return start();
     }
 
     const std::string& group() const { return group_; }
     uint16_t           port()  const { return port_; }
+    const std::string& iface() const { return iface_; }
 
     uint64_t packetsReceived() const { return packets_.load(); }
 

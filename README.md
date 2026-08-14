@@ -21,10 +21,13 @@ each entity on a world map in realtime.
   entity type, lat/lon/alt, ground speed, heading, update count and data age.
 - Built-in **schematic coastline** reference layer, plus a labelled graticule
   and a live **cursor lat/lon readout**.
-- **In-app connection settings** (`S`): change the multicast group and port at
-  runtime and rejoin live, without restarting the app. The last-used group/port
-  are **persisted** to `%APPDATA%\dis-map\config.ini` and restored on next launch
-  (command-line `--group` / `--port` still override the saved values).
+- **In-app connection settings** (`S`): change the multicast group, port, and
+  **local interface** at runtime and rejoin live, without restarting the app.
+  These are **persisted** to `%APPDATA%\dis-map\config.ini` and restored on next
+  launch (command-line `--group` / `--port` / `--iface` still override the saved
+  values). The local interface selects which NIC joins the group on multi-homed
+  hosts (`0.0.0.0` = let the OS choose). Note: for a multicast receiver the local
+  *port* is necessarily the group's port, so it is not separately configurable.
 - Stale tracks (no update for 30 s) are dropped automatically.
 - Optional `world.png` background (equirectangular, full -180..180 / -90..90);
   when present it replaces the built-in coastline.
@@ -37,7 +40,7 @@ each entity on a world map in realtime.
 | Left-drag        | Pan |
 | Mouse wheel      | Zoom about the cursor |
 | Click a track    | Select / show detail panel (click empty space to clear) |
-| `S`              | Connection settings — change multicast group / port and reconnect |
+| `S`              | Connection settings — change multicast group / port / local interface and reconnect |
 | `R`              | Reset view to fit |
 | `G`              | Toggle graticule |
 | `C`              | Toggle coastline layer |
@@ -60,6 +63,7 @@ Binaries land in `build/bin/Release/`.
 # Terminal 1 — the map
 build\bin\Release\dis_map.exe                       # defaults: 239.1.2.3:3000
 build\bin\Release\dis_map.exe --group=239.1.2.3 --port=3000
+build\bin\Release\dis_map.exe --iface=192.168.1.50  # bind the join to a NIC
 
 # Terminal 2 — the test source (moving entities)
 build\bin\Release\dis_sender.exe --rate=10

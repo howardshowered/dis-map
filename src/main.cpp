@@ -56,13 +56,16 @@ static std::wstring           g_statusLine = L"Starting...";
 // Connection config + settings-dialog handles.
 static std::string            g_group = "239.1.2.3";
 static uint16_t               g_port  = 3000;
+static std::string            g_iface = "0.0.0.0";   // local NIC for the join
 static HINSTANCE              g_hInst = nullptr;
 static HWND                   g_mainHwnd = nullptr;
 static HWND                   g_settingsHwnd = nullptr;
 static HWND                   g_hEditAddr = nullptr;
 static HWND                   g_hEditPort = nullptr;
-constexpr int                 kIdEditAddr = 101;
-constexpr int                 kIdEditPort = 102;
+static HWND                   g_hEditIface = nullptr;
+constexpr int                 kIdEditAddr  = 101;
+constexpr int                 kIdEditPort  = 102;
+constexpr int                 kIdEditIface = 103;
 
 static void saveConfig();   // persists g_group / g_port (defined below)
 
@@ -334,10 +337,13 @@ static std::string wideToNarrow(const std::wstring& w) {
 }
 
 static void applySettings(HWND hwnd) {
-    wchar_t a[64] = {0}, p[16] = {0};
-    GetWindowTextW(GetDlgItem(hwnd, kIdEditAddr), a, 63);
-    GetWindowTextW(GetDlgItem(hwnd, kIdEditPort), p, 15);
-    std::string addr = wideToNarrow(a);
+    wchar_t a[64] = {0}, p[16] = {0}, ifc[64] = {0};
+    GetWindowTextW(GetDlgItem(hwnd, kIdEditAddr),  a, 63);
+    GetWindowTextW(GetDlgItem(hwnd, kIdEditPort),  p, 15);
+    GetWindowTextW(GetDlgItem(hwnd, kIdEditIface), ifc, 63);
+    std::string addr  = wideToNarrow(a);
+    std::string iface = wideToNarrow(ifc);
+    if (iface.empty()) iface = "0.0.0.0";   // blank => any interface
     int portNum = _wtoi(p);
 
     in_addr probe{};
@@ -348,6 +354,12 @@ static void applySettings(HWND hwnd) {
     }
     if (portNum < 1 || portNum > 65535) {
         MessageBoxW(hwnd, L"Port must be between 1 and 65535.",
+                    L"Connection settings", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (inet_pton(AF_INET, iface.c_str(), &probe) != 1) {
+        MessageBoxW(hwnd, L"Local interface must be a valid IPv4 address, "
+                    L"or 0.0.0.0 for any interface.",
                     L"Connection settings", MB_OK | MB_ICONWARNING);
         return;
     }
@@ -363,7 +375,8 @@ static void applySettings(HWND hwnd) {
 
     g_group = addr;
     g_port  = (uint16_t)portNum;
-    if (g_receiver) g_receiver->restart(g_group, g_port);
+    g_iface = iface;
+    if (g_receiver) g_receiver->restart(g_group, g_port, g_iface);
     saveConfig();                 // remember the last-used connection
     g_selectedKey = 0;
     DestroyWindow(hwnd);
@@ -387,14 +400,20 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             mk(L"STATIC", L"Port:", 0, 14, 50, 110, 20, 0);
             g_hEditPort = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
                              128, 47, 80, 22, kIdEditPort);
-            mk(L"BUTTON", L"Connect", BS_DEFPUSHBUTTON, 54, 84, 90, 28, IDOK);
-            mk(L"BUTTON", L"Cancel",  0,                154, 84, 90, 28, IDCANCEL);
+            mk(L"STATIC", L"Local interface:", 0, 14, 82, 110, 20, 0);
+            g_hEditIface = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
+                              128, 79, 140, 22, kIdEditIface);
+            mk(L"STATIC", L"(0.0.0.0 = any NIC)", 0, 14, 108, 254, 18, 0);
+            mk(L"BUTTON", L"Connect", BS_DEFPUSHBUTTON, 54, 132, 90, 28, IDOK);
+            mk(L"BUTTON", L"Cancel",  0,                154, 132, 90, 28, IDCANCEL);
 
             // Seed fields with the current connection.
             std::wstring wg(g_group.begin(), g_group.end());
             SetWindowTextW(g_hEditAddr, wg.c_str());
             wchar_t pb[16]; swprintf(pb, 16, L"%u", g_port);
             SetWindowTextW(g_hEditPort, pb);
+            std::wstring wi(g_iface.begin(), g_iface.end());
+            SetWindowTextW(g_hEditIface, wi.c_str());
             return 0;
         }
 
@@ -411,7 +430,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             EnableWindow(g_mainHwnd, TRUE);
             SetForegroundWindow(g_mainHwnd);
             g_settingsHwnd = nullptr;
-            g_hEditAddr = g_hEditPort = nullptr;
+            g_hEditAddr = g_hEditPort = g_hEditIface = nullptr;
             return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -420,7 +439,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 static void openSettings() {
     if (g_settingsHwnd) { SetForegroundWindow(g_settingsHwnd); return; }
     RECT pr; GetWindowRect(g_mainHwnd, &pr);
-    const int w = 300, h = 160;
+    const int w = 300, h = 210;
     const int x = pr.left + ((pr.right - pr.left) - w) / 2;
     const int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
     g_settingsHwnd = CreateWindowExW(
@@ -580,6 +599,8 @@ static void loadConfig() {
         } else if (key == "port") {
             const int p = std::atoi(val.c_str());
             if (p >= 1 && p <= 65535) g_port = (uint16_t)p;
+        } else if (key == "iface" && !val.empty()) {
+            g_iface = val;
         }
     }
 }
@@ -590,10 +611,11 @@ static void saveConfig() {
     if (!f) return;
     f << "group=" << g_group << "\n";
     f << "port="  << g_port  << "\n";
+    f << "iface=" << g_iface << "\n";
 }
 
-// Parse "group:port" style args; defaults match the test sender.
-static void parseArgs(std::string& group, uint16_t& port) {
+// Parse command-line overrides: --group=, --port=, --iface=.
+static void parseArgs(std::string& group, uint16_t& port, std::string& iface) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; ++i) {
@@ -601,8 +623,9 @@ static void parseArgs(std::string& group, uint16_t& port) {
         auto toA = [](const std::wstring& w) {
             std::string s; for (wchar_t c : w) s += char(c); return s;
         };
-        if (a.rfind(L"--group=", 0) == 0)     group = toA(a.substr(8));
-        else if (a.rfind(L"--port=", 0) == 0) port = (uint16_t)_wtoi(a.substr(7).c_str());
+        if (a.rfind(L"--group=", 0) == 0)      group = toA(a.substr(8));
+        else if (a.rfind(L"--port=", 0) == 0)  port = (uint16_t)_wtoi(a.substr(7).c_str());
+        else if (a.rfind(L"--iface=", 0) == 0) iface = toA(a.substr(8));
     }
     if (argv) LocalFree(argv);
 }
@@ -613,10 +636,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     loadWorldImage();
     g_hInst = hInst;
 
-    loadConfig();                  // persisted last-used connection (if any)
-    parseArgs(g_group, g_port);    // command-line still overrides the config
+    loadConfig();                          // persisted last-used connection (if any)
+    parseArgs(g_group, g_port, g_iface);   // command-line still overrides the config
 
-    net::MulticastReceiver receiver(g_store, g_group, g_port);
+    net::MulticastReceiver receiver(g_store, g_group, g_port, g_iface);
     receiver.onStatus = [](const std::string& s) {
         std::wstring w(s.begin(), s.end());
         setStatus(w);
