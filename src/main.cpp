@@ -513,7 +513,8 @@ static void render(HDC hdc, int w, int h) {
         const auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             store::Clock::now() - t.lastSeen).count();
         std::wstring mk(t.marking.begin(), t.marking.end());
-        wchar_t lines[10][80];
+        constexpr int kNumLines = 16;
+        wchar_t lines[kNumLines][80];
         swprintf(lines[0], 80, L"%s", mk.empty() ? L"(no marking)" : mk.c_str());
         swprintf(lines[1], 80, L"ID  %u:%u:%u",
                  t.id.site, t.id.application, t.id.entity);
@@ -525,13 +526,20 @@ static void render(HDC hdc, int w, int h) {
         swprintf(lines[4], 80, L"Lat  %+.4f°", t.lla.lat);
         swprintf(lines[5], 80, L"Lon  %+.4f°", t.lla.lon);
         swprintf(lines[6], 80, L"Alt  %.0f m", t.lla.alt);
-        swprintf(lines[7], 80, L"Spd  %.0f kt  (%.0f m/s)",
+        // Geocentric position and linear velocity exactly as the PDU carried them.
+        swprintf(lines[7],  80, L"ECEF X  %+.1f m", t.ecefX);
+        swprintf(lines[8],  80, L"ECEF Y  %+.1f m", t.ecefY);
+        swprintf(lines[9],  80, L"ECEF Z  %+.1f m", t.ecefZ);
+        swprintf(lines[10], 80, L"Vel X  %+.1f m/s", t.velX);
+        swprintf(lines[11], 80, L"Vel Y  %+.1f m/s", t.velY);
+        swprintf(lines[12], 80, L"Vel Z  %+.1f m/s", t.velZ);
+        swprintf(lines[13], 80, L"Spd  %.0f kt  (%.0f m/s)",
                  t.groundSpeed * 1.94384, t.groundSpeed);
-        swprintf(lines[8], 80, L"Hdg  %.0f°", t.heading);
-        swprintf(lines[9], 80, L"Updates %llu   age %lldms",
+        swprintf(lines[14], 80, L"Hdg  %.0f°", t.heading);
+        swprintf(lines[15], 80, L"Updates %llu   age %lldms",
                  (unsigned long long)t.updates, (long long)ageMs);
 
-        const REAL px = 8, py = 112, pw = 240, ph = 190;
+        const REAL px = 8, py = 112, pw = 240, ph = kNumLines * 17.0f + 18;
         SolidBrush bg(Color(205, 10, 16, 24));
         g.FillRectangle(&bg, px, py, pw, ph);
         Pen border(forceColor(t.force), 1.5f);
@@ -539,7 +547,7 @@ static void render(HDC hdc, int w, int h) {
         FontFamily ffb(L"Segoe UI");
         Font title(&ffb, 14, FontStyleBold, UnitPixel);
         g.DrawString(lines[0], -1, &title, PointF(px + 10, py + 8), &label);
-        for (int i = 1; i < 10; ++i)
+        for (int i = 1; i < kNumLines; ++i)
             g.DrawString(lines[i], -1, &font,
                          PointF(px + 10, py + 8 + i * 17.0f), &label);
     }

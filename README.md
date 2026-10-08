@@ -29,7 +29,9 @@ warfare events.
   munition disappears once it detonates.
 - **Click a track to select it** — a detail panel shows Entity ID, force,
   entity type (with the kind named, e.g. `Munition 2.1.1.1.0`), lat/lon/alt,
-  ground speed, heading, update count and data age.
+  the raw **geocentric ECEF X/Y/Z** position and **linear velocity X/Y/Z**
+  exactly as the PDU carried them, ground speed, heading, update count and data
+  age.
 - **Warfare events** (`E` to toggle): a Fire PDU draws an amber muzzle flash at
   the launch point plus a dashed shot line with a travelling tracer — aimed at
   the target entity's current position, or along the munition's heading for the
@@ -118,7 +120,7 @@ background; otherwise a graticule is drawn.
 | `src/byteorder.h`    | Big-endian read/write helpers (DIS is network byte order). |
 | `src/dis.h`          | DIS v7 constants, per-type field offsets, Entity State / Fire / Detonation parsers and record writers. |
 | `src/geodetic.h`     | ECEF ⇄ geodetic (WGS84) conversion. |
-| `src/entity_store.h` | Thread-safe latest-state track table (incl. heading/ground speed). |
+| `src/entity_store.h` | Thread-safe latest-state track table (raw ECEF position/velocity plus derived heading/ground speed). |
 | `src/event_store.h`  | Thread-safe ring of recent Fire / Detonation events. |
 | `src/coastline.h`    | Coarse embedded world coastline for the reference layer. |
 | `src/receiver.h`     | Winsock multicast receiver thread. |

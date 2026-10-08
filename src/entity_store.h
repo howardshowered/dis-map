@@ -17,6 +17,10 @@ struct Track {
     dis::ForceId  force = dis::ForceId::Other;
     dis::EntityType type;
     geo::LatLonAlt lla{0, 0, 0};
+    // Raw PDU values, kept alongside the derived geodetic/ground-track figures
+    // so the detail panel can show what actually came over the wire.
+    double  ecefX = 0, ecefY = 0, ecefZ = 0;   // geocentric location (m)
+    double  velX = 0, velY = 0, velZ = 0;      // linear velocity (m/s, ECEF)
     double  speed = 0.0;          // m/s, magnitude of linear velocity (3D)
     double  groundSpeed = 0.0;    // m/s, horizontal component
     double  heading = 0.0;        // degrees, true ground track (0=N, 90=E)
@@ -43,6 +47,12 @@ public:
         t.force   = p.force;
         t.type    = p.type;
         t.lla     = geo::ecefToLla(p.ecefX, p.ecefY, p.ecefZ);
+        t.ecefX   = p.ecefX;
+        t.ecefY   = p.ecefY;
+        t.ecefZ   = p.ecefZ;
+        t.velX    = p.velX;
+        t.velY    = p.velY;
+        t.velZ    = p.velZ;
         t.speed   = std::sqrt(double(p.velX) * p.velX +
                               double(p.velY) * p.velY +
                               double(p.velZ) * p.velZ);
