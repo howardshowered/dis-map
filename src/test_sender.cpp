@@ -51,13 +51,55 @@ static void writeHeader(uint8_t* buf, uint8_t pduType, uint8_t family,
     be::wr_u8 (buf + 11, 0);                         // padding
 }
 
+// DIS entity orientation is the Euler triple (psi about Z, then theta about Y,
+// then phi about X) that rotates the *geocentric* axes onto the entity's body
+// axes — not the local-tangent-plane attitude. Derive it for an entity at
+// (lat, lon) flying a given local heading and pitch with wings level.
+static void localAttitudeToEuler(double latDeg, double lonDeg,
+                                 double headingDeg, double pitchDeg,
+                                 float& psi, float& theta, float& phi) {
+    constexpr double kDeg2Rad = 0.017453292519943295;
+    const double lat = latDeg * kDeg2Rad, lon = lonDeg * kDeg2Rad;
+    const double h = headingDeg * kDeg2Rad, p = pitchDeg * kDeg2Rad;
+    const double sl = std::sin(lat), cl = std::cos(lat);
+    const double so = std::sin(lon), co = std::cos(lon);
+
+    // Local North / East / Down unit vectors expressed in ECEF.
+    const double n[3] = { -sl * co, -sl * so,  cl  };
+    const double e[3] = { -so,       co,       0.0 };
+    const double d[3] = { -cl * co, -cl * so, -sl  };
+
+    // Body axes in the local NED frame, wings level.
+    const double ch = std::cos(h), sh = std::sin(h);
+    const double cp = std::cos(p), sp = std::sin(p);
+    const double fwdNed[3]   = {  cp * ch,  cp * sh, -sp };
+    const double rightNed[3] = { -sh,       ch,       0.0 };
+    const double downNed[3]  = {  sp * ch,  sp * sh,  cp };
+
+    auto toEcef = [&](const double v[3], double out[3]) {
+        for (int i = 0; i < 3; ++i)
+            out[i] = v[0] * n[i] + v[1] * e[i] + v[2] * d[i];
+    };
+    double fwd[3], right[3], down[3];
+    toEcef(fwdNed, fwd);
+    toEcef(rightNed, right);
+    toEcef(downNed, down);
+
+    // Rows of the ECEF -> body matrix are those body axes, so the standard
+    // 3-2-1 extraction recovers the DIS angles.
+    theta = (float)std::asin(-fwd[2]);
+    psi   = (float)std::atan2(fwd[1], fwd[0]);
+    phi   = (float)std::atan2(right[2], down[2]);
+}
+
 // Build an Entity State PDU into buf (returns length written). Velocity is
-// ECEF m/s; appearance carries the DIS appearance bits (see
-// dis::kAppearanceDeactivated).
+// ECEF m/s; orientation is the DIS Euler triple in radians; appearance carries
+// the DIS appearance bits (see dis::kAppearanceDeactivated).
 static int buildEspdu(uint8_t* buf, const dis::EntityId& id, dis::ForceId force,
                       const dis::EntityType& type,
                       double lat, double lon, double alt,
                       float vx, float vy, float vz,
+                      float psi, float theta, float phi,
                       uint32_t appearance, const char* marking,
                       uint32_t timestamp) {
     std::memset(buf, 0, dis::off::es::kMinLen);
@@ -83,9 +125,9 @@ static int buildEspdu(uint8_t* buf, const dis::EntityId& id, dis::ForceId force,
     be::wr_f64(buf + dis::off::es::kLocation + 16, z);
 
     // --- Orientation (rad) ---
-    be::wr_f32(buf + dis::off::es::kOrientation + 0, 0.0f);
-    be::wr_f32(buf + dis::off::es::kOrientation + 4, 0.0f);
-    be::wr_f32(buf + dis::off::es::kOrientation + 8, 0.0f);
+    be::wr_f32(buf + dis::off::es::kOrientation + 0, psi);
+    be::wr_f32(buf + dis::off::es::kOrientation + 4, theta);
+    be::wr_f32(buf + dis::off::es::kOrientation + 8, phi);
 
     be::wr_u32(buf + dis::off::es::kAppearance, appearance);
 
@@ -107,10 +149,16 @@ static int buildPlatformEspdu(uint8_t* buf, const SimEntity& e, uint32_t timesta
     // unit vector in ECEF at (lat,lon) is (-sin lon, cos lon, 0).
     const double lonRad = e.lon * 0.017453292519943295;
     const double dir = (e.lonPerSec >= 0) ? 1.0 : -1.0;   // E or W drift
+
+    // Level flight, nose along the direction of travel.
+    float psi, theta, phi;
+    localAttitudeToEuler(e.lat, e.lon, (dir >= 0) ? 90.0 : 270.0, 0.0,
+                         psi, theta, phi);
+
     return buildEspdu(buf, e.id(), e.force, type, e.lat, e.lon, e.altM,
                       (float)(dir * e.speedMps * -std::sin(lonRad)),
                       (float)(dir * e.speedMps *  std::cos(lonRad)),
-                      0.0f, 0, e.marking, timestamp);
+                      0.0f, psi, theta, phi, 0, e.marking, timestamp);
 }
 
 // Build a Fire PDU into buf (returns length written).
@@ -316,10 +364,22 @@ int main(int argc, char** argv) {
         const double dx = ax - mx, dy = ay - my, dz = az - mz;
         const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
         const double inv = (d > 1.0) ? (kMunitionSpeed / d) : 0.0;
+
+        // Nose along the flight vector: resolve it into the local frame to get
+        // the heading and pitch the round is actually flying.
+        double en, nn, up;
+        geo::ecefVelToEnu(lat, lon, dx * inv, dy * inv, dz * inv, en, nn, up);
+        const double ground = std::sqrt(en * en + nn * nn);
+        const double hdgDeg = std::atan2(en, nn) * 57.29577951308232;
+        const double pitchDeg = (ground > 1e-6 || std::fabs(up) > 1e-6)
+                              ? std::atan2(up, ground) * 57.29577951308232 : 0.0;
+        float psi, theta, phi;
+        localAttitudeToEuler(lat, lon, hdgDeg, pitchDeg, psi, theta, phi);
+
         int len = buildEspdu(buf, p.munitionId, p.force, p.desc.munition,
                              lat, lon, alt,
                              (float)(dx * inv), (float)(dy * inv), (float)(dz * inv),
-                             appearance, p.marking, ts++);
+                             psi, theta, phi, appearance, p.marking, ts++);
         sendto(s, (const char*)buf, len, 0, (sockaddr*)&dest, sizeof(dest));
     };
 

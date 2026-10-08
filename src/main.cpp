@@ -513,7 +513,7 @@ static void render(HDC hdc, int w, int h) {
         const auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             store::Clock::now() - t.lastSeen).count();
         std::wstring mk(t.marking.begin(), t.marking.end());
-        constexpr int kNumLines = 16;
+        constexpr int kNumLines = 19;
         wchar_t lines[kNumLines][80];
         swprintf(lines[0], 80, L"%s", mk.empty() ? L"(no marking)" : mk.c_str());
         swprintf(lines[1], 80, L"ID  %u:%u:%u",
@@ -536,7 +536,13 @@ static void render(HDC hdc, int w, int h) {
         swprintf(lines[13], 80, L"Spd  %.0f kt  (%.0f m/s)",
                  t.groundSpeed * 1.94384, t.groundSpeed);
         swprintf(lines[14], 80, L"Hdg  %.0f°", t.heading);
-        swprintf(lines[15], 80, L"Updates %llu   age %lldms",
+        // Orientation Euler angles, in degrees for legibility. These are
+        // relative to the geocentric axes, so Psi is not the Hdg above it.
+        constexpr double kRad2Deg = 57.29577951308232;
+        swprintf(lines[15], 80, L"Psi ψ  %+.1f°",   t.psi   * kRad2Deg);
+        swprintf(lines[16], 80, L"Theta θ  %+.1f°", t.theta * kRad2Deg);
+        swprintf(lines[17], 80, L"Phi φ  %+.1f°",   t.phi   * kRad2Deg);
+        swprintf(lines[18], 80, L"Updates %llu   age %lldms",
                  (unsigned long long)t.updates, (long long)ageMs);
 
         const REAL px = 8, py = 112, pw = 240, ph = kNumLines * 17.0f + 18;

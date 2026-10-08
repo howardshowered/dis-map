@@ -21,6 +21,10 @@ struct Track {
     // so the detail panel can show what actually came over the wire.
     double  ecefX = 0, ecefY = 0, ecefZ = 0;   // geocentric location (m)
     double  velX = 0, velY = 0, velZ = 0;      // linear velocity (m/s, ECEF)
+    // Orientation Euler angles (rad). These rotate the *geocentric* axes onto
+    // the entity's body axes, so psi is not the local compass heading — that
+    // is `heading` below, derived from the velocity in the local ENU frame.
+    double  psi = 0, theta = 0, phi = 0;       // yaw, pitch, roll
     double  speed = 0.0;          // m/s, magnitude of linear velocity (3D)
     double  groundSpeed = 0.0;    // m/s, horizontal component
     double  heading = 0.0;        // degrees, true ground track (0=N, 90=E)
@@ -53,6 +57,9 @@ public:
         t.velX    = p.velX;
         t.velY    = p.velY;
         t.velZ    = p.velZ;
+        t.psi     = p.psi;
+        t.theta   = p.theta;
+        t.phi     = p.phi;
         t.speed   = std::sqrt(double(p.velX) * p.velX +
                               double(p.velY) * p.velY +
                               double(p.velZ) * p.velZ);

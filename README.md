@@ -29,9 +29,12 @@ warfare events.
   munition disappears once it detonates.
 - **Click a track to select it** — a detail panel shows Entity ID, force,
   entity type (with the kind named, e.g. `Munition 2.1.1.1.0`), lat/lon/alt,
-  the raw **geocentric ECEF X/Y/Z** position and **linear velocity X/Y/Z**
-  exactly as the PDU carried them, ground speed, heading, update count and data
-  age.
+  the raw **geocentric ECEF X/Y/Z** position, **linear velocity X/Y/Z** and
+  **orientation Euler angles ψ/θ/φ** exactly as the PDU carried them, ground
+  speed, heading, update count and data age. Note the Euler angles rotate the
+  *geocentric* axes onto the entity's body axes, so `Psi` is not the compass
+  heading — that is the separate `Hdg` line, derived from the velocity in the
+  local East/North frame.
 - **Warfare events** (`E` to toggle): a Fire PDU draws an amber muzzle flash at
   the launch point plus a dashed shot line with a travelling tracer — aimed at
   the target entity's current position, or along the munition's heading for the
@@ -103,6 +106,10 @@ build\bin\Release\dis_sender.exe --rate=10
 build\bin\Release\dis_sender.exe --warfare=0   # entities only, no Fire/Detonation
 ```
 
+Sim entities are sent with correct DIS orientation — the Euler triple is derived
+from each entity's local heading and pitch, so the angles are geocentric-frame
+values rather than placeholder zeros.
+
 The sender fires a scripted shot every 4 s, cycling through an entity impact, a
 dud, a ground impact short of the target, and a proximity near miss, and prints
 each `FIRE` / `DET` to the console. While a round is in flight it also reports
@@ -120,7 +127,7 @@ background; otherwise a graticule is drawn.
 | `src/byteorder.h`    | Big-endian read/write helpers (DIS is network byte order). |
 | `src/dis.h`          | DIS v7 constants, per-type field offsets, Entity State / Fire / Detonation parsers and record writers. |
 | `src/geodetic.h`     | ECEF ⇄ geodetic (WGS84) conversion. |
-| `src/entity_store.h` | Thread-safe latest-state track table (raw ECEF position/velocity plus derived heading/ground speed). |
+| `src/entity_store.h` | Thread-safe latest-state track table (raw ECEF position/velocity/orientation plus derived heading/ground speed). |
 | `src/event_store.h`  | Thread-safe ring of recent Fire / Detonation events. |
 | `src/coastline.h`    | Coarse embedded world coastline for the reference layer. |
 | `src/receiver.h`     | Winsock multicast receiver thread. |
