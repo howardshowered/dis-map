@@ -1,5 +1,6 @@
 // UDP multicast receiver: joins a DIS multicast group and feeds Entity State
-// PDUs into the EntityStore on a background thread.
+// PDUs into the EntityStore and Fire/Detonation PDUs into the EventStore, all
+// on a background thread.
 #pragma once
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -9,6 +10,7 @@
 #include <functional>
 #include "dis.h"
 #include "entity_store.h"
+#include "event_store.h"
 
 namespace net {
 
@@ -19,10 +21,11 @@ public:
     std::function<void(const std::string&)> onStatus;
 
     MulticastReceiver(store::EntityStore& store,
+                      store::EventStore& events,
                       std::string group = "239.1.2.3",
                       uint16_t port = 3000,
                       std::string iface = "0.0.0.0")
-        : store_(store), group_(std::move(group)), port_(port),
+        : store_(store), events_(events), group_(std::move(group)), port_(port),
           iface_(std::move(iface)) {}
 
     ~MulticastReceiver() { stop(); }
@@ -121,14 +124,36 @@ private:
             if (n <= 0) continue;
 
             packets_.fetch_add(1);
-            dis::EntityStatePdu pdu;
-            if (dis::parseEntityState(buf, size_t(n), pdu)) {
-                store_.update(pdu);
+            dispatch(buf, size_t(n));
+        }
+    }
+
+    // Route one datagram to the store that owns its PDU type. Unknown types
+    // are counted (packets_) but otherwise ignored.
+    void dispatch(const uint8_t* buf, size_t len) {
+        switch (dis::pduType(buf, len)) {
+            case dis::kPduTypeEntityState: {
+                dis::EntityStatePdu p;
+                if (dis::parseEntityState(buf, len, p)) store_.update(p);
+                break;
             }
+            case dis::kPduTypeFire: {
+                dis::FirePdu p;
+                if (dis::parseFire(buf, len, p)) events_.addFire(p);
+                break;
+            }
+            case dis::kPduTypeDetonation: {
+                dis::DetonationPdu p;
+                if (dis::parseDetonation(buf, len, p)) events_.addDetonation(p);
+                break;
+            }
+            default:
+                break;
         }
     }
 
     store::EntityStore& store_;
+    store::EventStore&  events_;
     std::string group_;
     uint16_t    port_;
     std::string iface_;

@@ -1,8 +1,8 @@
-// DIS Map — Win32 + GDI+ realtime display of DIS v7 Entity State PDUs
-// received over UDP multicast.
+// DIS Map — Win32 + GDI+ realtime display of DIS v7 Entity State, Fire and
+// Detonation PDUs received over UDP multicast.
 //
 //   Left-drag : pan     Mouse wheel : zoom     R : reset view
-//   G : toggle graticule                       Esc : quit
+//   G : toggle graticule    E : toggle warfare events    Esc : quit
 //
 // Optional: drop an equirectangular "world.png" (full -180..180 lon,
 // -90..90 lat) next to the exe to use it as a map background.
@@ -20,12 +20,14 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <mutex>
 #include <cstdint>
 #include <cwchar>
 #include <fstream>
 
 #include "entity_store.h"
+#include "event_store.h"
 #include "receiver.h"
 #include "coastline.h"
 
@@ -37,16 +39,26 @@ using namespace Gdiplus;
 // Global state
 // ---------------------------------------------------------------------------
 static store::EntityStore     g_store;
+static store::EventStore      g_events;               // Fire / Detonation history
 static net::MulticastReceiver* g_receiver = nullptr;
 static ULONG_PTR              g_gdiToken = 0;
 static Image*                 g_worldImg = nullptr;   // optional background
 static bool                   g_showGrid = true;
 static bool                   g_showCoast = true;     // built-in coastline layer
+static bool                   g_showEvents = true;    // warfare event overlay + log
 
-// Selection + hit-testing (all touched only on the UI thread).
-static uint64_t               g_selectedKey = 0;      // 0 => nothing selected
+// Selection + hit-testing (all touched only on the UI thread). A track and an
+// event are never selected at the same time.
+static uint64_t               g_selectedKey = 0;      // 0 => no track selected
+static uint64_t               g_selectedEventSeq = 0; // 0 => no event selected
 struct HitEntry { uint64_t key; double sx, sy; };
 static std::vector<HitEntry>  g_lastPositions;
+static std::vector<HitEntry>  g_lastEventPositions;
+// Clickable rows of the warfare event log. Event markers usually sit right on
+// top of the shooter's or target's symbol, so the log is the reliable way to
+// pick one.
+struct LogRow { uint64_t seq; float x0, y0, x1, y1; };
+static std::vector<LogRow>    g_lastLogRows;
 static bool                   g_cursorValid = false;
 static double                 g_cursorLat = 0, g_cursorLon = 0;
 
@@ -125,6 +137,180 @@ static Color forceColor(dis::ForceId f) {
     }
 }
 
+static Color fireColor(BYTE a) { return Color(a, 255, 196, 64); }   // amber
+
+static Color detColor(uint8_t result, BYTE a) {
+    if (dis::detonationIsDud(result)) return Color(a, 165, 175, 185);  // grey — no function
+    if (dis::detonationIsHit(result)) return Color(a, 255, 85, 55);    // red — target struck
+    return Color(a, 255, 150, 70);                                      // orange — miss / ground
+}
+
+// Flat-earth offset: move (lat,lon) rangeM metres along a true heading. Only
+// used to draw a shot line when the target entity's position is unknown.
+static void offsetLatLon(double lat, double lon, double rangeM, double headingDeg,
+                         double& outLat, double& outLon) {
+    constexpr double kMetresPerDeg = 111320.0;
+    constexpr double kDeg2Rad = 0.017453292519943295;
+    const double rad = headingDeg * kDeg2Rad;
+    outLat = lat + (rangeM * std::cos(rad)) / kMetresPerDeg;
+    double cosLat = std::cos(lat * kDeg2Rad);
+    if (std::fabs(cosLat) < 1e-6) cosLat = (cosLat < 0 ? -1e-6 : 1e-6);
+    outLon = lon + (rangeM * std::sin(rad)) / (kMetresPerDeg * cosLat);
+}
+
+// Warfare event overlay: amber muzzle flash + shot line for Fire PDUs,
+// expanding shockwave rings for Detonation PDUs. Each marker animates for a
+// few seconds, then lingers as a faint residual until it ages out of the
+// store — residuals stay clickable so you can inspect a shot after the fact.
+static void drawEvents(Graphics& g,
+                       const std::vector<store::Engagement>& events,
+                       const std::unordered_map<uint64_t, const store::Track*>& byKey,
+                       int w, int h) {
+    g_lastEventPositions.clear();
+    const auto now = store::Clock::now();
+
+    for (const auto& e : events) {
+        // Anchor the marker: prefer the PDU's own world location, else fall back
+        // to the target entity (detonations may carry only entity-frame coords).
+        double lat = e.lla.lat, lon = e.lla.lon;
+        if (!e.locValid) {
+            auto it = byKey.find(e.target.key());
+            if (it == byKey.end()) continue;   // nothing to anchor to — skip
+            lat = it->second->lla.lat;
+            lon = it->second->lla.lon;
+        }
+
+        double sx, sy;
+        worldToScreen(lat, lon, sx, sy);
+        if (sx < -60 || sy < -60 || sx > w + 60 || sy > h + 60) continue;
+
+        g_lastEventPositions.push_back({ e.seq, sx, sy });
+
+        // k runs 1 -> 0 across the animation window, then goes negative.
+        const double k = 1.0 - double(e.ageMs(now)) / e.animMs();
+        const bool animating = (k > 0.0);
+        const BYTE a = (BYTE)(animating ? (70.0 + 165.0 * k) : 55.0);
+
+        if (e.seq == g_selectedEventSeq) {
+            Pen sel(Color(255, 255, 230, 120), 2.0f);
+            g.DrawEllipse(&sel, (REAL)(sx - 13), (REAL)(sy - 13), 26.0f, 26.0f);
+        }
+
+        if (e.kind == store::EventKind::Fire) {
+            // Shot line toward the target's current position, or along the
+            // munition's heading for the reported range if the target is unknown.
+            double tx = 0, ty = 0;
+            bool haveLine = false;
+            auto it = byKey.find(e.target.key());
+            if (!e.target.isNone() && it != byKey.end()) {
+                worldToScreen(it->second->lla.lat, it->second->lla.lon, tx, ty);
+                haveLine = true;
+            } else if (e.range > 0.0 && e.speed > 0.0) {
+                double tlat, tlon;
+                offsetLatLon(lat, lon, e.range, e.heading, tlat, tlon);
+                worldToScreen(tlat, tlon, tx, ty);
+                haveLine = true;
+            }
+            if (haveLine) {
+                Pen shot(Color((BYTE)(a * 0.75), 255, 210, 110), 1.6f);
+                REAL dash[] = { 5.0f, 4.0f };
+                shot.SetDashPattern(dash, 2);
+                g.DrawLine(&shot, (REAL)sx, (REAL)sy, (REAL)tx, (REAL)ty);
+                if (animating) {
+                    // Tracer running from launch point to target over the window.
+                    const double t = 1.0 - k;
+                    const double px = sx + (tx - sx) * t, py = sy + (ty - sy) * t;
+                    SolidBrush tracer(Color(235, 255, 235, 170));
+                    g.FillEllipse(&tracer, (REAL)(px - 3), (REAL)(py - 3), 6.0f, 6.0f);
+                }
+            }
+
+            // Muzzle flash: a four-ray star that shrinks as the event ages.
+            static const double kRay[4][2] = {
+                { 0.7071, 0.7071 }, { -0.7071, 0.7071 },
+                { -0.7071, -0.7071 }, { 0.7071, -0.7071 }
+            };
+            const double rr = animating ? (9.0 + 8.0 * k) : 6.0;
+            Pen ray(fireColor(a), animating ? 2.0f : 1.0f);
+            for (const auto& d : kRay) {
+                g.DrawLine(&ray,
+                           (REAL)(sx + d[0] * rr * 0.35), (REAL)(sy + d[1] * rr * 0.35),
+                           (REAL)(sx + d[0] * rr),        (REAL)(sy + d[1] * rr));
+            }
+            SolidBrush core(fireColor(a));
+            g.FillEllipse(&core, (REAL)(sx - 3), (REAL)(sy - 3), 6.0f, 6.0f);
+        } else {
+            // Detonation: two trailing shockwave rings plus a bright core.
+            constexpr double kMaxR = 26.0;
+            for (int ring = 0; ring < 2; ++ring) {
+                const double phase = (1.0 - k) - ring * 0.25;
+                if (phase <= 0.0 || phase >= 1.0) continue;
+                const double rr = 4.0 + kMaxR * phase;
+                Pen wave(detColor(e.result, (BYTE)(a * (1.0 - phase))), 2.0f);
+                g.DrawEllipse(&wave, (REAL)(sx - rr), (REAL)(sy - rr),
+                              (REAL)(rr * 2), (REAL)(rr * 2));
+            }
+            if (dis::detonationIsDud(e.result)) {
+                // A dud gets an X so it never reads as a live burst.
+                Pen x(detColor(e.result, a), 2.0f);
+                const REAL d = 5.0f;
+                g.DrawLine(&x, (REAL)(sx - d), (REAL)(sy - d), (REAL)(sx + d), (REAL)(sy + d));
+                g.DrawLine(&x, (REAL)(sx - d), (REAL)(sy + d), (REAL)(sx + d), (REAL)(sy - d));
+            } else {
+                const REAL cr = (REAL)(animating ? (3.0 + 4.0 * k) : 3.0);
+                SolidBrush core(detColor(e.result, a));
+                g.FillEllipse(&core, (REAL)(sx - cr), (REAL)(sy - cr), cr * 2, cr * 2);
+            }
+        }
+    }
+}
+
+// Scrolling log of the most recent engagements, newest first (bottom-right).
+// Rows are clickable — see g_lastLogRows.
+static void drawEventLog(Graphics& g, Font& font,
+                         const std::vector<store::Engagement>& events,
+                         int w, int h) {
+    g_lastLogRows.clear();
+    if (events.empty()) return;
+    const auto now = store::Clock::now();
+    const int maxRows = 6;
+    const int rows = (int)std::min<size_t>(maxRows, events.size());
+
+    const REAL pw = 300, rowH = 16.0f, ph = rows * rowH + 24.0f;
+    const REAL px = (REAL)(w - pw - 8), py = (REAL)(h - 28) - ph;
+
+    SolidBrush bg(Color(170, 8, 12, 20));
+    g.FillRectangle(&bg, px, py, pw, ph);
+    Pen border(Color(90, 150, 170, 190), 1.0f);
+    g.DrawRectangle(&border, px, py, pw, ph);
+    SolidBrush hdr(Color(200, 180, 205, 225));
+    g.DrawString(L"Warfare events", -1, &font, PointF(px + 8, py + 3), &hdr);
+
+    for (int i = 0; i < rows; ++i) {
+        const auto& e = events[events.size() - 1 - i];   // newest first
+        const REAL ry = py + 20 + i * rowH;
+        g_lastLogRows.push_back({ e.seq, px, ry, px + pw, ry + rowH });
+        if (e.seq == g_selectedEventSeq) {
+            SolidBrush hi(Color(60, 255, 230, 120));
+            g.FillRectangle(&hi, px + 1, ry, pw - 2, rowH);
+        }
+        const double ageS = e.ageMs(now) / 1000.0;
+        wchar_t line[128];
+        if (e.kind == store::EventKind::Fire) {
+            swprintf(line, 128, L"%4.1fs  FIRE  %u:%u:%u → %u:%u:%u",
+                     ageS, e.firing.site, e.firing.application, e.firing.entity,
+                     e.target.site, e.target.application, e.target.entity);
+        } else {
+            swprintf(line, 128, L"%4.1fs  DET   %u:%u:%u  %hs",
+                     ageS, e.target.site, e.target.application, e.target.entity,
+                     dis::detonationResultName(e.result));
+        }
+        SolidBrush txt(e.kind == store::EventKind::Fire ? fireColor(235)
+                                                        : detColor(e.result, 235));
+        g.DrawString(line, -1, &font, PointF(px + 8, ry), &txt);
+    }
+}
+
 static void drawCoastline(Graphics& g) {
     SolidBrush land(Color(255, 33, 52, 60));
     Pen shore(Color(180, 90, 140, 150), 1.0f);
@@ -199,8 +385,24 @@ static void render(HDC hdc, int w, int h) {
 
     if (g_showGrid) drawGraticule(g, font, w, h);
 
-    // Entities.
     auto tracks = g_store.snapshot();
+
+    // Warfare events go under the entity symbols so tracks stay readable. They
+    // need the track table to resolve shot lines and detonations that carry no
+    // world location of their own.
+    std::vector<store::Engagement> events;
+    if (g_showEvents) {
+        events = g_events.snapshot();
+        std::unordered_map<uint64_t, const store::Track*> byKey;
+        byKey.reserve(tracks.size() * 2);
+        for (const auto& t : tracks) byKey[t.id.key()] = &t;
+        drawEvents(g, events, byKey, w, h);
+    } else {
+        g_lastEventPositions.clear();
+        g_lastLogRows.clear();
+    }
+
+    // Entities.
     g_lastPositions.clear();
     const store::Track* selectedTrack = nullptr;
     for (const auto& t : tracks) {
@@ -289,15 +491,79 @@ static void render(HDC hdc, int w, int h) {
                          PointF(px + 10, py + 8 + i * 17.0f), &label);
     }
 
+    // Detail panel for the selected warfare event (shares the track panel's
+    // slot — only one of the two can be selected at a time).
+    const store::Engagement* selectedEvent = nullptr;
+    for (const auto& e : events)
+        if (e.seq == g_selectedEventSeq) { selectedEvent = &e; break; }
+    if (g_selectedEventSeq && !selectedEvent)
+        g_selectedEventSeq = 0;         // aged out of the store
+
+    if (selectedEvent) {
+        const auto& e = *selectedEvent;
+        const bool isFire = (e.kind == store::EventKind::Fire);
+        const auto& m = e.descriptor;
+        wchar_t lines[13][80];
+        swprintf(lines[0], 80, L"%s", isFire ? L"FIRE" : L"DETONATION");
+        swprintf(lines[1], 80, L"Event  %u:%u:%u",
+                 e.event.site, e.event.application, e.event.number);
+        swprintf(lines[2], 80, L"Shooter  %u:%u:%u",
+                 e.firing.site, e.firing.application, e.firing.entity);
+        if (e.target.isNone())
+            swprintf(lines[3], 80, L"Target  (none)");
+        else
+            swprintf(lines[3], 80, L"Target  %u:%u:%u",
+                     e.target.site, e.target.application, e.target.entity);
+        swprintf(lines[4], 80, L"Munition  %u.%u.%u.%u.%u",
+                 m.munition.kind, m.munition.domain, m.munition.category,
+                 m.munition.subcategory, m.munition.specific);
+        swprintf(lines[5], 80, L"Warhead %u   Fuse %u", m.warhead, m.fuse);
+        swprintf(lines[6], 80, L"Qty %u   Rate %u/min", m.quantity, m.rate);
+        if (e.locValid) {
+            swprintf(lines[7], 80, L"Lat  %+.4f°", e.lla.lat);
+            swprintf(lines[8], 80, L"Lon  %+.4f°", e.lla.lon);
+            swprintf(lines[9], 80, L"Alt  %.0f m", e.lla.alt);
+        } else {
+            swprintf(lines[7], 80, L"Lat  (target-relative)");
+            swprintf(lines[8], 80, L"Lon  (target-relative)");
+            swprintf(lines[9], 80, L"Alt  —");
+        }
+        if (isFire)
+            swprintf(lines[10], 80, L"Range  %.1f km", e.range / 1000.0);
+        else
+            swprintf(lines[10], 80, L"Result  %hs", dis::detonationResultName(e.result));
+        swprintf(lines[11], 80, L"Munition spd  %.0f m/s", e.speed);
+        swprintf(lines[12], 80, L"Age  %.1f s",
+                 e.ageMs(store::Clock::now()) / 1000.0);
+
+        const REAL px = 8, py = 112, pw = 240, ph = 13 * 17.0f + 18;
+        SolidBrush bg(Color(205, 10, 16, 24));
+        g.FillRectangle(&bg, px, py, pw, ph);
+        const Color accent = isFire ? fireColor(255) : detColor(e.result, 255);
+        Pen border(accent, 1.5f);
+        g.DrawRectangle(&border, px, py, pw, ph);
+        FontFamily ffb(L"Segoe UI");
+        Font title(&ffb, 14, FontStyleBold, UnitPixel);
+        SolidBrush titleBrush(accent);
+        g.DrawString(lines[0], -1, &title, PointF(px + 10, py + 8), &titleBrush);
+        for (int i = 1; i < 13; ++i)
+            g.DrawString(lines[i], -1, &font,
+                         PointF(px + 10, py + 8 + i * 17.0f), &label);
+    }
+
+    if (g_showEvents) drawEventLog(g, font, events, w, h);
+
     // HUD.
     std::wstring status;
     { std::lock_guard<std::mutex> lk(g_statusMtx); status = g_statusLine; }
     wchar_t cur[48] = L"";
     if (g_cursorValid)
         swprintf(cur, 48, L"   cursor: %+.2f, %+.2f", g_cursorLat, g_cursorLon);
-    wchar_t hud[320];
-    swprintf(hud, 320, L"%s   |   tracks: %zu   packets: %llu%s",
+    wchar_t hud[384];
+    swprintf(hud, 384, L"%s   |   tracks: %zu   fire: %llu   det: %llu   packets: %llu%s",
              status.c_str(), tracks.size(),
+             (unsigned long long)g_events.fireCount(),
+             (unsigned long long)g_events.detonationCount(),
              (unsigned long long)(g_receiver ? g_receiver->packetsReceived() : 0), cur);
     SolidBrush panelBg(Color(180, 0, 0, 0));
     g.FillRectangle(&panelBg, 0.0f, 0.0f, (REAL)w, 24.0f);
@@ -305,7 +571,7 @@ static void render(HDC hdc, int w, int h) {
     g.DrawString(hud, -1, &font, PointF(8, 5), &hudBrush);
 
     SolidBrush legendBg(Color(150, 0, 0, 0));
-    g.FillRectangle(&legendBg, (REAL)(w - 132), 28.0f, 124.0f, 78.0f);
+    g.FillRectangle(&legendBg, (REAL)(w - 132), 28.0f, 124.0f, 132.0f);
     struct { const wchar_t* n; dis::ForceId f; } leg[] = {
         {L"Friendly", dis::ForceId::Friendly},
         {L"Opposing", dis::ForceId::Opposing},
@@ -318,10 +584,25 @@ static void render(HDC hdc, int w, int h) {
         g.FillEllipse(&b, (REAL)(w - 124), y, 10.0f, 10.0f);
         g.DrawString(leg[i].n, -1, &font, PointF((REAL)(w - 108), y - 2), &label);
     }
+    // Warfare event key, greyed out while the overlay is hidden.
+    struct { const wchar_t* n; Color c; } evLeg[] = {
+        {L"Fire",    fireColor(255)},
+        {L"Det hit", detColor(1, 255)},   // 1 = Entity Impact
+        {L"Det miss",detColor(3, 255)},   // 3 = Ground Impact
+        {L"Dud",     detColor(6, 255)},   // 6 = None / Dud
+    };
+    for (int i = 0; i < 4; ++i) {
+        const Color c = g_showEvents ? evLeg[i].c : Color(70, 150, 150, 150);
+        SolidBrush b(c);
+        REAL y = 108 + i * 14.0f;
+        g.FillEllipse(&b, (REAL)(w - 124), y, 8.0f, 8.0f);
+        SolidBrush t(g_showEvents ? Color(235, 235, 235, 235) : Color(110, 190, 190, 190));
+        g.DrawString(evLeg[i].n, -1, &font, PointF((REAL)(w - 110), y - 4), &t);
+    }
 
     // Key hint line.
     SolidBrush hint(Color(130, 170, 190, 205));
-    g.DrawString(L"S: connection   G: grid   C: coastline   R: reset   wheel: zoom   click: select track",
+    g.DrawString(L"S: connection   G: grid   C: coastline   E: events   R: reset   wheel: zoom   click: select",
                  -1, &font, PointF(8, (REAL)(h - 20)), &hint);
 
     // Blit.
@@ -485,17 +766,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_LBUTTONDOWN: {
             const int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-            // Hit-test tracks first (within 9 px); a hit selects, else pan.
+            // A click in the event log selects that engagement and never pans.
+            for (const auto& r : g_lastLogRows) {
+                if (mx >= r.x0 && mx <= r.x1 && my >= r.y0 && my <= r.y1) {
+                    g_selectedEventSeq = (g_selectedEventSeq == r.seq) ? 0 : r.seq;
+                    g_selectedKey = 0;
+                    return 0;
+                }
+            }
+            // Hit-test tracks first (within 9 px), then warfare events (12 px);
+            // tracks win ties because their symbols are smaller. No hit => pan.
             double best = 9.0 * 9.0; uint64_t hit = 0;
             for (const auto& e : g_lastPositions) {
                 const double dx = e.sx - mx, dy = e.sy - my;
                 const double d2 = dx * dx + dy * dy;
                 if (d2 <= best) { best = d2; hit = e.key; }
             }
+            uint64_t evHit = 0;
+            if (!hit) {
+                double evBest = 12.0 * 12.0;
+                for (const auto& e : g_lastEventPositions) {
+                    const double dx = e.sx - mx, dy = e.sy - my;
+                    const double d2 = dx * dx + dy * dy;
+                    if (d2 <= evBest) { evBest = d2; evHit = e.key; }
+                }
+            }
             if (hit) {
-                g_selectedKey = hit;   // toggle handled below if same
+                g_selectedKey = hit;        // selecting a track clears any event
+                g_selectedEventSeq = 0;
+            } else if (evHit) {
+                g_selectedEventSeq = evHit;
+                g_selectedKey = 0;
             } else {
                 g_selectedKey = 0;     // click empty space clears selection
+                g_selectedEventSeq = 0;
                 g_dragging = true;
                 g_dragStart.x = mx; g_dragStart.y = my;
                 g_dragOffX = g_view.offX;
@@ -545,6 +849,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_showGrid = !g_showGrid;
             } else if (wp == 'C') {
                 g_showCoast = !g_showCoast;
+            } else if (wp == 'E') {
+                g_showEvents = !g_showEvents;
             } else if (wp == 'S') {
                 openSettings();
             }
@@ -639,7 +945,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     loadConfig();                          // persisted last-used connection (if any)
     parseArgs(g_group, g_port, g_iface);   // command-line still overrides the config
 
-    net::MulticastReceiver receiver(g_store, g_group, g_port, g_iface);
+    net::MulticastReceiver receiver(g_store, g_events, g_group, g_port, g_iface);
     receiver.onStatus = [](const std::string& s) {
         std::wstring w(s.begin(), s.end());
         setStatus(w);
@@ -666,7 +972,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     RegisterClassW(&sc);
 
     HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"DIS Map — Entity State (multicast)",
+        0, wc.lpszClassName, L"DIS Map — Entity State / Fire / Detonation (multicast)",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 640,
         nullptr, nullptr, hInst, nullptr);
     g_mainHwnd = hwnd;
