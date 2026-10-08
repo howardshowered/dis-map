@@ -29,6 +29,15 @@ class EntityStore {
 public:
     // Called from the receiver thread for every valid Entity State PDU.
     void update(const dis::EntityStatePdu& p) {
+        // A deactivated entity has left the exercise — a munition that has
+        // detonated, say. Drop it rather than letting it sit until it goes
+        // stale; sims mark the round deactivated in its final Entity State.
+        if (dis::isDeactivated(p.appearance)) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            tracks_.erase(p.id.key());
+            return;
+        }
+
         Track t;
         t.id      = p.id;
         t.force   = p.force;

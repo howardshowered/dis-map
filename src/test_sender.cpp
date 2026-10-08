@@ -51,33 +51,33 @@ static void writeHeader(uint8_t* buf, uint8_t pduType, uint8_t family,
     be::wr_u8 (buf + 11, 0);                         // padding
 }
 
-// Build an Entity State PDU into buf (returns length written).
-static int buildEspdu(uint8_t* buf, const SimEntity& e, uint32_t timestamp) {
+// Build an Entity State PDU into buf (returns length written). Velocity is
+// ECEF m/s; appearance carries the DIS appearance bits (see
+// dis::kAppearanceDeactivated).
+static int buildEspdu(uint8_t* buf, const dis::EntityId& id, dis::ForceId force,
+                      const dis::EntityType& type,
+                      double lat, double lon, double alt,
+                      float vx, float vy, float vz,
+                      uint32_t appearance, const char* marking,
+                      uint32_t timestamp) {
     std::memset(buf, 0, dis::off::es::kMinLen);
     writeHeader(buf, dis::kPduTypeEntityState, dis::kFamilyEntityInfo,
                 (uint16_t)dis::off::es::kMinLen, timestamp);
 
-    dis::writeEntityId(buf + dis::off::es::kEntityId, e.id());
+    dis::writeEntityId(buf + dis::off::es::kEntityId, id);
 
-    be::wr_u8(buf + dis::off::es::kForceId, (uint8_t)e.force);
+    be::wr_u8(buf + dis::off::es::kForceId, (uint8_t)force);
     be::wr_u8(buf + dis::off::es::kNumArtic, 0);
 
-    // --- Entity type: platform / air / generic ---
-    be::wr_u8 (buf + dis::off::es::kEntityType + 0, 1);  // kind = platform
-    be::wr_u8 (buf + dis::off::es::kEntityType + 1, 2);  // domain = air
+    dis::writeEntityType(buf + dis::off::es::kEntityType, type);
 
-    // --- Velocity (ECEF, m/s): true eastward motion so heading resolves to
-    //     ~090 and on-map track vectors point along the direction of travel.
-    //     East unit vector in ECEF at (lat,lon) is (-sin lon, cos lon, 0).
-    const double lonRad = e.lon * 0.017453292519943295;
-    const double dir = (e.lonPerSec >= 0) ? 1.0 : -1.0;   // E or W drift
-    be::wr_f32(buf + dis::off::es::kVelocity + 0, (float)(dir * e.speedMps * -std::sin(lonRad)));
-    be::wr_f32(buf + dis::off::es::kVelocity + 4, (float)(dir * e.speedMps *  std::cos(lonRad)));
-    be::wr_f32(buf + dis::off::es::kVelocity + 8, 0.0f);
+    be::wr_f32(buf + dis::off::es::kVelocity + 0, vx);
+    be::wr_f32(buf + dis::off::es::kVelocity + 4, vy);
+    be::wr_f32(buf + dis::off::es::kVelocity + 8, vz);
 
     // --- Location: geodetic -> ECEF ---
     double x, y, z;
-    geo::llaToEcef(e.lat, e.lon, e.altM, x, y, z);
+    geo::llaToEcef(lat, lon, alt, x, y, z);
     be::wr_f64(buf + dis::off::es::kLocation + 0, x);
     be::wr_f64(buf + dis::off::es::kLocation + 8, y);
     be::wr_f64(buf + dis::off::es::kLocation + 16, z);
@@ -87,14 +87,30 @@ static int buildEspdu(uint8_t* buf, const SimEntity& e, uint32_t timestamp) {
     be::wr_f32(buf + dis::off::es::kOrientation + 4, 0.0f);
     be::wr_f32(buf + dis::off::es::kOrientation + 8, 0.0f);
 
-    // --- Appearance ---
-    be::wr_u32(buf + dis::off::es::kAppearance, 0);
+    be::wr_u32(buf + dis::off::es::kAppearance, appearance);
 
     // --- Marking: charset (1) = ASCII, then up to 11 chars ---
     be::wr_u8(buf + dis::off::es::kMarking, 1);
-    std::strncpy(reinterpret_cast<char*>(buf + dis::off::es::kMarking + 1), e.marking, 11);
+    std::strncpy(reinterpret_cast<char*>(buf + dis::off::es::kMarking + 1), marking, 11);
 
     return dis::off::es::kMinLen;
+}
+
+// Entity State for one of the scripted platforms.
+static int buildPlatformEspdu(uint8_t* buf, const SimEntity& e, uint32_t timestamp) {
+    dis::EntityType type;
+    type.kind   = dis::kEntityKindPlatform;
+    type.domain = 2;   // air
+
+    // Velocity (ECEF, m/s): true eastward motion so heading resolves to ~090
+    // and on-map track vectors point along the direction of travel. The East
+    // unit vector in ECEF at (lat,lon) is (-sin lon, cos lon, 0).
+    const double lonRad = e.lon * 0.017453292519943295;
+    const double dir = (e.lonPerSec >= 0) ? 1.0 : -1.0;   // E or W drift
+    return buildEspdu(buf, e.id(), e.force, type, e.lat, e.lon, e.altM,
+                      (float)(dir * e.speedMps * -std::sin(lonRad)),
+                      (float)(dir * e.speedMps *  std::cos(lonRad)),
+                      0.0f, 0, e.marking, timestamp);
 }
 
 // Build a Fire PDU into buf (returns length written).
@@ -175,15 +191,37 @@ static const Shot kShots[] = {
 };
 constexpr int kNumShots = int(sizeof(kShots) / sizeof(kShots[0]));
 constexpr double kFireIntervalSec = 4.0;
+constexpr double kMunitionSpeed   = 850.0;   // m/s
 
-// A Fire PDU that has gone out and is awaiting its Detonation PDU.
+// A Fire PDU that has gone out and is awaiting its Detonation PDU. While it is
+// pending, the munition reports its own Entity State PDUs so the map shows the
+// round in flight, not just the launch and the impact.
 struct Pending {
     double   tLeft;      // seconds until the detonation is sent
+    double   flightSec;  // total flight time, for interpolating the position
     uint16_t eventNum;
     const Shot* shot;
     dis::EntityId munitionId;
     dis::MunitionDescriptor desc;
+    dis::ForceId force;                        // the shooter's force
+    double launchLat, launchLon, launchAlt;
+    char   marking[12];
 };
+
+// Shortest signed longitude difference, so a shot never interpolates the long
+// way round the globe.
+static double lonDelta(double from, double to) {
+    double d = to - from;
+    while (d > 180.0)  d -= 360.0;
+    while (d < -180.0) d += 360.0;
+    return d;
+}
+
+static double wrapLon(double lon) {
+    if (lon > 180.0)  lon -= 360.0;
+    if (lon < -180.0) lon += 360.0;
+    return lon;
+}
 
 // Flat-earth offset, used to place a near-miss impact point off the target.
 static void offsetLatLon(double lat, double lon, double rangeM, double bearingDeg,
@@ -265,13 +303,31 @@ int main(int argc, char** argv) {
     uint8_t buf[256];
     const double dt = 1.0 / rate;
     uint32_t ts = 0;
+
+    // Entity State for a munition in flight: positioned at (lat,lon,alt) and
+    // running at kMunitionSpeed toward the aim point.
+    auto sendMunitionState = [&](const Pending& p,
+                                 double lat, double lon, double alt,
+                                 double aimLat, double aimLon, double aimAlt,
+                                 uint32_t appearance) {
+        double mx, my, mz, ax, ay, az;
+        geo::llaToEcef(lat, lon, alt, mx, my, mz);
+        geo::llaToEcef(aimLat, aimLon, aimAlt, ax, ay, az);
+        const double dx = ax - mx, dy = ay - my, dz = az - mz;
+        const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double inv = (d > 1.0) ? (kMunitionSpeed / d) : 0.0;
+        int len = buildEspdu(buf, p.munitionId, p.force, p.desc.munition,
+                             lat, lon, alt,
+                             (float)(dx * inv), (float)(dy * inv), (float)(dz * inv),
+                             appearance, p.marking, ts++);
+        sendto(s, (const char*)buf, len, 0, (sockaddr*)&dest, sizeof(dest));
+    };
+
     while (true) {
         for (auto& e : ents) {
-            e.lon += e.lonPerSec * dt;
-            if (e.lon > 180.0)  e.lon -= 360.0;
-            if (e.lon < -180.0) e.lon += 360.0;
+            e.lon = wrapLon(e.lon + e.lonPerSec * dt);
 
-            int len = buildEspdu(buf, e, ts++);
+            int len = buildPlatformEspdu(buf, e, ts++);
             sendto(s, (const char*)buf, len, 0, (sockaddr*)&dest, sizeof(dest));
         }
 
@@ -292,7 +348,6 @@ int main(int argc, char** argv) {
                 const double range = std::sqrt(dx * dx + dy * dy + dz * dz);
 
                 // Munition velocity: straight at the target at ~850 m/s.
-                constexpr double kMunitionSpeed = 850.0;
                 const double inv = (range > 1.0) ? (kMunitionSpeed / range) : 0.0;
 
                 dis::FirePdu f;
@@ -312,14 +367,39 @@ int main(int argc, char** argv) {
                 std::printf("FIRE  event %u  %s -> %s  range %.0f km\n",
                             eventNum, sh.marking, tg.marking, range / 1000.0);
 
-                pending.push_back({ shot.flightSec, eventNum, &shot,
-                                    f.munitionId, desc });
+                Pending p{};
+                p.tLeft      = shot.flightSec;
+                p.flightSec  = shot.flightSec;
+                p.eventNum   = eventNum;
+                p.shot       = &shot;
+                p.munitionId = f.munitionId;
+                p.desc       = desc;
+                p.force      = sh.force;
+                p.launchLat  = sh.lat;
+                p.launchLon  = sh.lon;
+                p.launchAlt  = sh.altM;
+                std::snprintf(p.marking, sizeof(p.marking), "MSL-%u", eventNum);
+                pending.push_back(p);
             }
 
             // --- Detonation: fire the matching impact once flight time elapses ---
             for (size_t i = 0; i < pending.size();) {
                 pending[i].tLeft -= dt;
-                if (pending[i].tLeft > 0.0) { ++i; continue; }
+                if (pending[i].tLeft > 0.0) {
+                    // Still in flight: report the round's own Entity State,
+                    // homing from the launch point onto the target.
+                    const Pending& fp = pending[i];
+                    const SimEntity& tgt = ents[fp.shot->target];
+                    const double prog = 1.0 - (fp.tLeft / fp.flightSec);
+                    const double mlat = fp.launchLat + (tgt.lat - fp.launchLat) * prog;
+                    const double mlon = wrapLon(fp.launchLon +
+                                                lonDelta(fp.launchLon, tgt.lon) * prog);
+                    const double malt = fp.launchAlt + (tgt.altM - fp.launchAlt) * prog;
+                    sendMunitionState(fp, mlat, mlon, malt,
+                                      tgt.lat, tgt.lon, tgt.altM, 0);
+                    ++i;
+                    continue;
+                }
 
                 const Pending& p = pending[i];
                 const Shot& shot = *p.shot;
@@ -354,6 +434,12 @@ int main(int argc, char** argv) {
 
                 int len = buildDetonationPdu(buf, d, ts++);
                 sendto(s, (const char*)buf, len, 0, (sockaddr*)&dest, sizeof(dest));
+
+                // Final Entity State for the round, flagged deactivated, so the
+                // munition track is removed instead of lingering until stale.
+                sendMunitionState(p, ilat, ilon, ialt, ilat, ilon, ialt,
+                                  dis::kAppearanceDeactivated);
+
                 std::printf("DET   event %u  %s  %s\n", p.eventNum, tg.marking,
                             dis::detonationResultName(shot.result));
 

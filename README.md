@@ -18,8 +18,18 @@ warfare events.
   Other).
 - **Ground-track heading vectors** derived from each entity's ECEF velocity
   (rotated into the local East/North frame), length scaled by speed.
+- **Munitions get their own symbol**: an entity whose Entity Type kind is
+  `2` (Munition) is drawn as a sharp dart pointing along its ground track, with
+  the speed cue trailing *behind* it, so a round in flight reads differently at
+  a glance from the platform that fired it. A munition with no usable ground
+  track falls back to a diamond. Every other entity kind keeps the standard dot,
+  and force colouring applies to all symbols alike.
+- Entities whose appearance marks them **deactivated** (Entity Appearance bit
+  23) are removed immediately rather than lingering until stale — this is how a
+  munition disappears once it detonates.
 - **Click a track to select it** — a detail panel shows Entity ID, force,
-  entity type, lat/lon/alt, ground speed, heading, update count and data age.
+  entity type (with the kind named, e.g. `Munition 2.1.1.1.0`), lat/lon/alt,
+  ground speed, heading, update count and data age.
 - **Warfare events** (`E` to toggle): a Fire PDU draws an amber muzzle flash at
   the launch point plus a dashed shot line with a travelling tracer — aimed at
   the target entity's current position, or along the munition's heading for the
@@ -93,7 +103,10 @@ build\bin\Release\dis_sender.exe --warfare=0   # entities only, no Fire/Detonati
 
 The sender fires a scripted shot every 4 s, cycling through an entity impact, a
 dud, a ground impact short of the target, and a proximity near miss, and prints
-each `FIRE` / `DET` to the console.
+each `FIRE` / `DET` to the console. While a round is in flight it also reports
+the munition's own Entity State PDUs (marked `MSL-<event>`), so the munition
+symbol appears on the map between the launch and the impact; the round's final
+Entity State is flagged deactivated so its track is removed on detonation.
 
 Drop an equirectangular `world.png` next to `dis_map.exe` for a real map
 background; otherwise a graticule is drawn.
@@ -120,6 +133,9 @@ background; otherwise a graticule is drawn.
   Trailing articulation parameters on Entity State and variable parameter
   records on Detonation are not decoded.
 - Warhead and fuse are shown as raw enumeration values rather than names.
+- Entity symbols distinguish munitions from everything else; the remaining
+  entity kinds (life form, supply, sensor, …) all share the standard dot and are
+  told apart only by the kind name in the detail panel.
 - Multicast on a single host relies on default loopback being enabled (it is on
   Windows). Across hosts, ensure the sender's `IP_MULTICAST_TTL` and any router
   IGMP config allow the group through. To bind a specific NIC on a multi-homed

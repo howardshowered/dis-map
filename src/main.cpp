@@ -137,6 +137,53 @@ static Color forceColor(dis::ForceId f) {
     }
 }
 
+// Map a point given in a track-local frame (fwd = along the ground track,
+// right = 90° clockwise from it) to screen pixels. Screen y grows downward and
+// heading 0 is north, so forward is (sin h, -cos h) and right is (cos h, sin h).
+static PointF trackLocalPoint(double sx, double sy, double headingRad,
+                              double fwd, double right) {
+    const double s = std::sin(headingRad), c = std::cos(headingRad);
+    return PointF((REAL)(sx + fwd * s + right * c),
+                  (REAL)(sy - fwd * c + right * s));
+}
+
+// Symbol for one track. Munitions get a sharp dart pointing along their ground
+// track so a round in flight reads differently from the platform that fired it;
+// every other entity kind keeps the standard dot.
+static void drawTrackSymbol(Graphics& g, const store::Track& t,
+                            double sx, double sy, const Color& c) {
+    SolidBrush fill(c);
+    Pen ring(Color(200, 255, 255, 255), 1.0f);
+
+    if (!dis::isMunition(t.type)) {
+        const REAL r = 5.0f;
+        g.FillEllipse(&fill, (REAL)(sx - r), (REAL)(sy - r), r * 2, r * 2);
+        g.DrawEllipse(&ring, (REAL)(sx - r), (REAL)(sy - r), r * 2, r * 2);
+        return;
+    }
+
+    if (t.groundSpeed <= 0.5) {
+        // No usable ground track, so draw a diamond — it implies no direction.
+        PointF d[4] = {
+            PointF((REAL)sx, (REAL)(sy - 6)), PointF((REAL)(sx + 4), (REAL)sy),
+            PointF((REAL)sx, (REAL)(sy + 6)), PointF((REAL)(sx - 4), (REAL)sy),
+        };
+        g.FillPolygon(&fill, d, 4);
+        g.DrawPolygon(&ring, d, 4);
+        return;
+    }
+
+    const double rad = t.heading * 0.017453292519943295;
+    PointF dart[4] = {
+        trackLocalPoint(sx, sy, rad,  8.0,  0.0),   // tip
+        trackLocalPoint(sx, sy, rad, -4.0,  5.0),   // right barb
+        trackLocalPoint(sx, sy, rad, -1.5,  0.0),   // tail notch
+        trackLocalPoint(sx, sy, rad, -4.0, -5.0),   // left barb
+    };
+    g.FillPolygon(&fill, dart, 4);
+    g.DrawPolygon(&ring, dart, 4);
+}
+
 static Color fireColor(BYTE a) { return Color(a, 255, 196, 64); }   // amber
 
 static Color detColor(uint8_t result, BYTE a) {
@@ -415,18 +462,24 @@ static void render(HDC hdc, int w, int h) {
         if (selected) selectedTrack = &t;
 
         Color c = forceColor(t.force);
-        SolidBrush dot(c);
-        Pen ring(Color(200, 255, 255, 255), 1.0f);
-        const REAL r = 5.0f;
+        const bool munition = dis::isMunition(t.type);
 
-        // Ground-track heading vector, length scaled by speed (clamped).
+        // Velocity cue, length scaled by speed (clamped). Platforms get a
+        // heading vector ahead of the symbol; a munition gets a trail behind
+        // instead, so its dart stays the clearest indication of where it is
+        // headed rather than being speared by its own vector.
         if (t.groundSpeed > 0.5) {
             const double rad = t.heading * 0.017453292519943295;
             const double len = 12.0 + std::min(28.0, t.groundSpeed / 6.0);
-            const double ex = sx + len * std::sin(rad);
-            const double ey = sy - len * std::cos(rad);
-            Pen vec(c, 2.0f);
-            g.DrawLine(&vec, (REAL)sx, (REAL)sy, (REAL)ex, (REAL)ey);
+            if (munition) {
+                Pen trail(Color(150, c.GetR(), c.GetG(), c.GetB()), 1.5f);
+                g.DrawLine(&trail, trackLocalPoint(sx, sy, rad, -4.0, 0.0),
+                                   trackLocalPoint(sx, sy, rad, -len, 0.0));
+            } else {
+                Pen vec(c, 2.0f);
+                g.DrawLine(&vec, PointF((REAL)sx, (REAL)sy),
+                                 trackLocalPoint(sx, sy, rad, len, 0.0));
+            }
         }
 
         if (selected) {
@@ -434,8 +487,7 @@ static void render(HDC hdc, int w, int h) {
             g.DrawEllipse(&sel, (REAL)(sx - 10), (REAL)(sy - 10), 20.0f, 20.0f);
         }
 
-        g.FillEllipse(&dot, (REAL)(sx - r), (REAL)(sy - r), r * 2, r * 2);
-        g.DrawEllipse(&ring, (REAL)(sx - r), (REAL)(sy - r), r * 2, r * 2);
+        drawTrackSymbol(g, t, sx, sy, c);
 
         // Marking / callsign label.
         std::wstring txt;
@@ -466,7 +518,8 @@ static void render(HDC hdc, int w, int h) {
         swprintf(lines[1], 80, L"ID  %u:%u:%u",
                  t.id.site, t.id.application, t.id.entity);
         swprintf(lines[2], 80, L"Force  %hs", dis::forceName(t.force));
-        swprintf(lines[3], 80, L"Type  %u.%u.%u.%u.%u",
+        swprintf(lines[3], 80, L"Type  %hs  %u.%u.%u.%u.%u",
+                 dis::entityKindName(t.type.kind),
                  t.type.kind, t.type.domain, t.type.category,
                  t.type.subcategory, t.type.specific);
         swprintf(lines[4], 80, L"Lat  %+.4f°", t.lla.lat);
@@ -571,7 +624,7 @@ static void render(HDC hdc, int w, int h) {
     g.DrawString(hud, -1, &font, PointF(8, 5), &hudBrush);
 
     SolidBrush legendBg(Color(150, 0, 0, 0));
-    g.FillRectangle(&legendBg, (REAL)(w - 132), 28.0f, 124.0f, 132.0f);
+    g.FillRectangle(&legendBg, (REAL)(w - 132), 28.0f, 124.0f, 150.0f);
     struct { const wchar_t* n; dis::ForceId f; } leg[] = {
         {L"Friendly", dis::ForceId::Friendly},
         {L"Opposing", dis::ForceId::Opposing},
@@ -584,6 +637,22 @@ static void render(HDC hdc, int w, int h) {
         g.FillEllipse(&b, (REAL)(w - 124), y, 10.0f, 10.0f);
         g.DrawString(leg[i].n, -1, &font, PointF((REAL)(w - 108), y - 2), &label);
     }
+    // Shape key: the dart marks a munition in flight (any force colour).
+    {
+        SolidBrush b(Color(235, 235, 235, 235));
+        Pen outline(Color(200, 255, 255, 255), 1.0f);
+        const double cx = w - 119, cy = 104;
+        PointF dart[4] = {
+            trackLocalPoint(cx, cy, 1.5707963267948966,  7.0,  0.0),
+            trackLocalPoint(cx, cy, 1.5707963267948966, -4.0,  4.5),
+            trackLocalPoint(cx, cy, 1.5707963267948966, -1.5,  0.0),
+            trackLocalPoint(cx, cy, 1.5707963267948966, -4.0, -4.5),
+        };
+        g.FillPolygon(&b, dart, 4);
+        g.DrawPolygon(&outline, dart, 4);
+        g.DrawString(L"Munition", -1, &font, PointF((REAL)(w - 108), 97.0f), &label);
+    }
+
     // Warfare event key, greyed out while the overlay is hidden.
     struct { const wchar_t* n; Color c; } evLeg[] = {
         {L"Fire",    fireColor(255)},
@@ -594,7 +663,7 @@ static void render(HDC hdc, int w, int h) {
     for (int i = 0; i < 4; ++i) {
         const Color c = g_showEvents ? evLeg[i].c : Color(70, 150, 150, 150);
         SolidBrush b(c);
-        REAL y = 108 + i * 14.0f;
+        REAL y = 122 + i * 14.0f;
         g.FillEllipse(&b, (REAL)(w - 124), y, 8.0f, 8.0f);
         SolidBrush t(g_showEvents ? Color(235, 235, 235, 235) : Color(110, 190, 190, 190));
         g.DrawString(evLeg[i].n, -1, &font, PointF((REAL)(w - 110), y - 4), &t);

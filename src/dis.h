@@ -63,6 +63,12 @@ enum class ForceId : uint8_t {
     Neutral  = 3,
 };
 
+// Entity Kind (IEEE 1278.1 Annex B, UID 7) — the first field of an Entity Type.
+constexpr uint8_t kEntityKindPlatform   = 1;
+constexpr uint8_t kEntityKindMunition   = 2;
+constexpr uint8_t kEntityKindLifeForm   = 3;
+constexpr uint8_t kEntityKindExpendable = 8;
+
 struct EntityType {
     uint8_t  kind = 0;      // 1=Platform, 2=Munition, 3=Life form, ...
     uint8_t  domain = 0;    // 1=Land, 2=Air, 3=Surface, 4=Subsurface, 5=Space
@@ -72,6 +78,19 @@ struct EntityType {
     uint8_t  specific = 0;
     uint8_t  extra = 0;
 };
+
+// A munition in flight — a round reported by its own Entity State PDUs between
+// the Fire and the Detonation. Drawn with a distinct symbol on the map.
+inline bool isMunition(const EntityType& t) { return t.kind == kEntityKindMunition; }
+
+// Entity Appearance bit 23 is the State field, common to every appearance
+// record variant: 0 = Active, 1 = Deactivated. A deactivated entity has left
+// the exercise (a munition that has detonated, a platform removed) and should
+// no longer be displayed.
+constexpr uint32_t kAppearanceDeactivated = 1u << 23;
+inline bool isDeactivated(uint32_t appearance) {
+    return (appearance & kAppearanceDeactivated) != 0;
+}
 
 // Munition descriptor (IEEE 1278.1 §5.2.17) — 16 bytes, carried by both the
 // Fire and the Detonation PDU.
@@ -362,6 +381,21 @@ inline const char* forceName(ForceId f) {
         case ForceId::Opposing: return "Opposing";
         case ForceId::Neutral:  return "Neutral";
         default:                return "Other";
+    }
+}
+
+inline const char* entityKindName(uint8_t kind) {
+    switch (kind) {
+        case 1: return "Platform";
+        case 2: return "Munition";
+        case 3: return "Life form";
+        case 4: return "Environmental";
+        case 5: return "Cultural feature";
+        case 6: return "Supply";
+        case 7: return "Radio";
+        case 8: return "Expendable";
+        case 9: return "Sensor/Emitter";
+        default: return "Other";
     }
 }
 
